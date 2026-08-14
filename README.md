@@ -40,8 +40,12 @@ their repos outside of Claude Code.
    Give it the scopes you actually need (`repo` for private repo access,
    `workflow` if you want it triggering Actions).
 
-3. Add it to your Claude Desktop config
-   (`claude_desktop_config.json`):
+3. Add it to your Claude Desktop config. Don't create a
+   `claude_desktop_config.json` yourself somewhere and expect Claude Desktop
+   to find it, that file has to be the one the app actually reads, and
+   creating a separate one won't work. Instead, open Claude Desktop, go to
+   Settings -> Developer -> Edit Config, and that opens the real config
+   file for you to edit:
 
    ```json
    {
