@@ -1,10 +1,11 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+<![CDATA[import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { Octokit } from "@octokit/rest";
+import { z } from "zod";
 
 const token = process.env.GITHUB_TOKEN;
 if (!token) {
@@ -14,8 +15,196 @@ if (!token) {
 
 const octokit = new Octokit({ auth: token });
 
+// --- Startup scope check -----------------------------------------------
+// Fail fast with a clear message instead of letting a missing scope
+// surface as a confusing 403 deep inside some later tool call.
+async function checkTokenScopes() {
+  try {
+    const res = await octokit.request("GET /user");
+    const scopeHeader = res.headers["x-oauth-scopes"] ?? "";
+    const scopes = scopeHeader.split(",").map((s) => s.trim()).filter(Boolean);
+    const missing: string[] = [];
+    if (!scopes.includes("repo")) missing.push("repo");
+    if (!scopes.includes("workflow")) missing.push("workflow");
+    if (missing.length > 0) {
+      console.error(
+        `Warning: GITHUB_TOKEN is missing recommended scope(s): ${missing.join(", ")}. ` +
+        `Tools that need them (e.g. trigger_workflow needs 'workflow', private repo access needs 'repo') will fail until the token is regenerated with those scopes.`
+      );
+    }
+  } catch (err: any) {
+    // Fine-grained PATs don't return x-oauth-scopes at all — that's not an
+    // error, just a different token type. Only warn on an actual auth failure.
+    if (err?.status === 401) {
+      console.error("Warning: GITHUB_TOKEN appears to be invalid or expired.");
+    }
+  }
+}
+
+// --- Argument validation -------------------------------------------------
+// Each tool gets a zod schema. Parsing failures produce a clear, specific
+// message ("owner: Required") instead of a raw TypeError from a `!` assertion
+// deep inside a switch case.
+const schemas = {
+  list_repos: z.object({
+    type: z.enum(["all", "owner", "public", "private", "forks"]).default("all"),
+    sort: z.enum(["created", "updated", "pushed", "full_name"]).default("updated"),
+    per_page: z.number().default(30),
+  }),
+  get_repo: z.object({ owner: z.string(), repo: z.string() }),
+  list_branches: z.object({ owner: z.string(), repo: z.string() }),
+  create_branch: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    branch: z.string(),
+    from_branch: z.string().optional(),
+  }),
+  delete_branch: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    branch: z.string(),
+    confirm: z.boolean().default(false),
+  }),
+  get_file: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    path: z.string(),
+    branch: z.string().optional(),
+  }),
+  create_or_update_file: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    path: z.string(),
+    content: z.string(),
+    message: z.string(),
+    branch: z.string().optional(),
+    sha: z.string().optional(),
+  }),
+  delete_file: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    path: z.string(),
+    message: z.string(),
+    sha: z.string(),
+    branch: z.string().optional(),
+    confirm: z.boolean().default(false),
+  }),
+  list_directory: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    path: z.string().default(""),
+    branch: z.string().optional(),
+  }),
+  list_issues: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    state: z.enum(["open", "closed", "all"]).default("open"),
+    per_page: z.number().default(30),
+  }),
+  get_issue: z.object({ owner: z.string(), repo: z.string(), issue_number: z.number() }),
+  create_issue: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    title: z.string(),
+    body: z.string().optional(),
+    labels: z.array(z.string()).optional(),
+    assignees: z.array(z.string()).optional(),
+  }),
+  update_issue: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    issue_number: z.number(),
+    title: z.string().optional(),
+    body: z.string().optional(),
+    state: z.enum(["open", "closed"]).optional(),
+    labels: z.array(z.string()).optional(),
+    assignees: z.array(z.string()).optional(),
+  }),
+  comment_on_issue: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    issue_number: z.number(),
+    body: z.string(),
+  }),
+  list_pull_requests: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    state: z.enum(["open", "closed", "all"]).default("open"),
+    per_page: z.number().default(30),
+  }),
+  get_pull_request: z.object({ owner: z.string(), repo: z.string(), pull_number: z.number() }),
+  create_pull_request: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    title: z.string(),
+    body: z.string().optional(),
+    head: z.string(),
+    base: z.string(),
+    draft: z.boolean().default(false),
+  }),
+  merge_pull_request: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    pull_number: z.number(),
+    merge_method: z.enum(["merge", "squash", "rebase"]).default("merge"),
+    commit_message: z.string().optional(),
+    confirm: z.boolean().default(false),
+  }),
+  list_workflows: z.object({ owner: z.string(), repo: z.string() }),
+  list_workflow_runs: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    workflow_id: z.string(),
+    per_page: z.number().default(10),
+  }),
+  trigger_workflow: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    workflow_id: z.string(),
+    ref: z.string(),
+    inputs: z.record(z.string()).default({}),
+    confirm: z.boolean().default(false),
+  }),
+  search_code: z.object({ query: z.string(), per_page: z.number().default(20) }),
+  search_issues: z.object({ query: z.string(), per_page: z.number().default(20) }),
+  list_commits: z.object({
+    owner: z.string(),
+    repo: z.string(),
+    branch: z.string().optional(),
+    per_page: z.number().default(20),
+  }),
+  create_repo: z.object({
+    name: z.string(),
+    description: z.string().optional(),
+    private: z.boolean().default(true),
+    auto_init: z.boolean().default(true),
+  }),
+  get_authenticated_user: z.object({}),
+} as const;
+
+type ToolName = keyof typeof schemas;
+
+// Tools that mutate or destroy state outside the local filesystem and can't
+// be trivially undone (or are annoying enough to undo that a caller should
+// have to mean it). Each requires `confirm: true` in the call args.
+const DESTRUCTIVE_TOOLS = new Set<ToolName>([
+  "delete_branch",
+  "delete_file",
+  "merge_pull_request",
+  "trigger_workflow",
+]);
+
+function confirmationRequiredMessage(name: string, args: Record<string, unknown>) {
+  const preview = JSON.stringify(args, null, 2);
+  return (
+    `'${name}' is a destructive operation and was not executed. ` +
+    `Re-call it with "confirm": true once you've confirmed this is intended.\n\n` +
+    `Args that would be used:\n${preview}`
+  );
+}
+
 const server = new Server(
-  { name: "github-mcp", version: "1.0.0" },
+  { name: "github-mcp", version: "1.1.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -38,10 +227,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "Get details about a specific repository",
       inputSchema: {
         type: "object",
-        properties: {
-          owner: { type: "string" },
-          repo: { type: "string" }
-        },
+        properties: { owner: { type: "string" }, repo: { type: "string" } },
         required: ["owner", "repo"]
       }
     },
@@ -50,10 +236,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "List branches in a repository",
       inputSchema: {
         type: "object",
-        properties: {
-          owner: { type: "string" },
-          repo: { type: "string" }
-        },
+        properties: { owner: { type: "string" }, repo: { type: "string" } },
         required: ["owner", "repo"]
       }
     },
@@ -63,23 +246,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          branch: { type: "string" },
-          from_branch: { type: "string" }
+          owner: { type: "string" }, repo: { type: "string" },
+          branch: { type: "string" }, from_branch: { type: "string" }
         },
         required: ["owner", "repo", "branch"]
       }
     },
     {
       name: "delete_branch",
-      description: "Delete a branch from a repository",
+      description: "Delete a branch from a repository. Destructive — requires confirm: true.",
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          branch: { type: "string" }
+          owner: { type: "string" }, repo: { type: "string" }, branch: { type: "string" },
+          confirm: { type: "boolean", default: false, description: "Must be true to actually perform the deletion." }
         },
         required: ["owner", "repo", "branch"]
       }
@@ -90,10 +270,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          path: { type: "string" },
-          branch: { type: "string" }
+          owner: { type: "string" }, repo: { type: "string" },
+          path: { type: "string" }, branch: { type: "string" }
         },
         required: ["owner", "repo", "path"]
       }
@@ -104,29 +282,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          path: { type: "string" },
-          content: { type: "string" },
-          message: { type: "string" },
-          branch: { type: "string" },
-          sha: { type: "string" }
+          owner: { type: "string" }, repo: { type: "string" }, path: { type: "string" },
+          content: { type: "string" }, message: { type: "string" },
+          branch: { type: "string" }, sha: { type: "string" }
         },
         required: ["owner", "repo", "path", "content", "message"]
       }
     },
     {
       name: "delete_file",
-      description: "Delete a file from a repository",
+      description: "Delete a file from a repository. Destructive — requires confirm: true.",
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          path: { type: "string" },
-          message: { type: "string" },
-          sha: { type: "string" },
-          branch: { type: "string" }
+          owner: { type: "string" }, repo: { type: "string" }, path: { type: "string" },
+          message: { type: "string" }, sha: { type: "string" }, branch: { type: "string" },
+          confirm: { type: "boolean", default: false, description: "Must be true to actually perform the deletion." }
         },
         required: ["owner", "repo", "path", "message", "sha"]
       }
@@ -137,10 +308,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          path: { type: "string", default: "" },
-          branch: { type: "string" }
+          owner: { type: "string" }, repo: { type: "string" },
+          path: { type: "string", default: "" }, branch: { type: "string" }
         },
         required: ["owner", "repo"]
       }
@@ -151,8 +320,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
+          owner: { type: "string" }, repo: { type: "string" },
           state: { type: "string", enum: ["open", "closed", "all"], default: "open" },
           per_page: { type: "number", default: 30 }
         },
@@ -164,11 +332,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "Get a specific issue",
       inputSchema: {
         type: "object",
-        properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          issue_number: { type: "number" }
-        },
+        properties: { owner: { type: "string" }, repo: { type: "string" }, issue_number: { type: "number" } },
         required: ["owner", "repo", "issue_number"]
       }
     },
@@ -178,11 +342,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          title: { type: "string" },
-          body: { type: "string" },
-          labels: { type: "array", items: { type: "string" } },
+          owner: { type: "string" }, repo: { type: "string" }, title: { type: "string" },
+          body: { type: "string" }, labels: { type: "array", items: { type: "string" } },
           assignees: { type: "array", items: { type: "string" } }
         },
         required: ["owner", "repo", "title"]
@@ -194,11 +355,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          issue_number: { type: "number" },
-          title: { type: "string" },
-          body: { type: "string" },
+          owner: { type: "string" }, repo: { type: "string" }, issue_number: { type: "number" },
+          title: { type: "string" }, body: { type: "string" },
           state: { type: "string", enum: ["open", "closed"] },
           labels: { type: "array", items: { type: "string" } },
           assignees: { type: "array", items: { type: "string" } }
@@ -212,10 +370,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          issue_number: { type: "number" },
-          body: { type: "string" }
+          owner: { type: "string" }, repo: { type: "string" },
+          issue_number: { type: "number" }, body: { type: "string" }
         },
         required: ["owner", "repo", "issue_number", "body"]
       }
@@ -226,8 +382,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
+          owner: { type: "string" }, repo: { type: "string" },
           state: { type: "string", enum: ["open", "closed", "all"], default: "open" },
           per_page: { type: "number", default: 30 }
         },
@@ -239,11 +394,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "Get details of a specific pull request",
       inputSchema: {
         type: "object",
-        properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          pull_number: { type: "number" }
-        },
+        properties: { owner: { type: "string" }, repo: { type: "string" }, pull_number: { type: "number" } },
         required: ["owner", "repo", "pull_number"]
       }
     },
@@ -253,12 +404,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          title: { type: "string" },
-          body: { type: "string" },
-          head: { type: "string" },
-          base: { type: "string" },
+          owner: { type: "string" }, repo: { type: "string" }, title: { type: "string" },
+          body: { type: "string" }, head: { type: "string" }, base: { type: "string" },
           draft: { type: "boolean", default: false }
         },
         required: ["owner", "repo", "title", "head", "base"]
@@ -266,15 +413,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "merge_pull_request",
-      description: "Merge a pull request",
+      description: "Merge a pull request. Destructive — requires confirm: true.",
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          pull_number: { type: "number" },
+          owner: { type: "string" }, repo: { type: "string" }, pull_number: { type: "number" },
           merge_method: { type: "string", enum: ["merge", "squash", "rebase"], default: "merge" },
-          commit_message: { type: "string" }
+          commit_message: { type: "string" },
+          confirm: { type: "boolean", default: false, description: "Must be true to actually perform the merge." }
         },
         required: ["owner", "repo", "pull_number"]
       }
@@ -284,10 +430,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "List GitHub Actions workflows in a repository",
       inputSchema: {
         type: "object",
-        properties: {
-          owner: { type: "string" },
-          repo: { type: "string" }
-        },
+        properties: { owner: { type: "string" }, repo: { type: "string" } },
         required: ["owner", "repo"]
       }
     },
@@ -297,25 +440,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          workflow_id: { type: "string" },
-          per_page: { type: "number", default: 10 }
+          owner: { type: "string" }, repo: { type: "string" },
+          workflow_id: { type: "string" }, per_page: { type: "number", default: 10 }
         },
         required: ["owner", "repo", "workflow_id"]
       }
     },
     {
       name: "trigger_workflow",
-      description: "Manually trigger a GitHub Actions workflow",
+      description: "Manually trigger a GitHub Actions workflow. Destructive — requires confirm: true.",
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          workflow_id: { type: "string" },
-          ref: { type: "string" },
-          inputs: { type: "object" }
+          owner: { type: "string" }, repo: { type: "string" }, workflow_id: { type: "string" },
+          ref: { type: "string" }, inputs: { type: "object" },
+          confirm: { type: "boolean", default: false, description: "Must be true to actually trigger the run." }
         },
         required: ["owner", "repo", "workflow_id", "ref"]
       }
@@ -325,10 +464,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "Search for code across your GitHub repositories",
       inputSchema: {
         type: "object",
-        properties: {
-          query: { type: "string" },
-          per_page: { type: "number", default: 20 }
-        },
+        properties: { query: { type: "string" }, per_page: { type: "number", default: 20 } },
         required: ["query"]
       }
     },
@@ -337,10 +473,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "Search issues and pull requests across repositories",
       inputSchema: {
         type: "object",
-        properties: {
-          query: { type: "string" },
-          per_page: { type: "number", default: 20 }
-        },
+        properties: { query: { type: "string" }, per_page: { type: "number", default: 20 } },
         required: ["query"]
       }
     },
@@ -350,10 +483,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          owner: { type: "string" },
-          repo: { type: "string" },
-          branch: { type: "string" },
-          per_page: { type: "number", default: 20 }
+          owner: { type: "string" }, repo: { type: "string" },
+          branch: { type: "string" }, per_page: { type: "number", default: 20 }
         },
         required: ["owner", "repo"]
       }
@@ -364,10 +495,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          name: { type: "string" },
-          description: { type: "string" },
-          private: { type: "boolean", default: true },
-          auto_init: { type: "boolean", default: true }
+          name: { type: "string" }, description: { type: "string" },
+          private: { type: "boolean", default: true }, auto_init: { type: "boolean", default: true }
         },
         required: ["name"]
       }
@@ -381,16 +510,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: rawArgs } = request.params;
+
+  if (!(name in schemas)) {
+    return { content: [{ type: "text", text: `Error: Unknown tool: ${name}` }], isError: true };
+  }
+  const toolName = name as ToolName;
+
+  // Validate before doing anything else. A bad call fails with a specific,
+  // actionable message instead of a raw TypeError from deep inside a case.
+  const parsed = schemas[toolName].safeParse(rawArgs ?? {});
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+      .join("; ");
+    return { content: [{ type: "text", text: `Error: invalid arguments for '${toolName}': ${issues}` }], isError: true };
+  }
+  const args = parsed.data as any;
+
+  if (DESTRUCTIVE_TOOLS.has(toolName) && !args.confirm) {
+    return { content: [{ type: "text", text: confirmationRequiredMessage(toolName, args) }] };
+  }
 
   try {
-    switch (name) {
+    switch (toolName) {
       case "list_repos": {
-        const { data } = await octokit.repos.listForAuthenticatedUser({
-          type: (args?.type as any) ?? "all",
-          sort: (args?.sort as any) ?? "updated",
-          per_page: (args?.per_page as number) ?? 30
-        });
+        const { data } = await octokit.repos.listForAuthenticatedUser(args);
         return { content: [{ type: "text", text: JSON.stringify(data.map(r => ({
           name: r.name, full_name: r.full_name, private: r.private,
           description: r.description, default_branch: r.default_branch,
@@ -399,34 +544,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_repo": {
-        const { data } = await octokit.repos.get({ owner: args!.owner as string, repo: args!.repo as string });
+        const { data } = await octokit.repos.get(args);
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
 
       case "list_branches": {
-        const { data } = await octokit.repos.listBranches({ owner: args!.owner as string, repo: args!.repo as string });
+        const { data } = await octokit.repos.listBranches(args);
         return { content: [{ type: "text", text: JSON.stringify(data.map(b => ({ name: b.name, sha: b.commit.sha })), null, 2) }] };
       }
 
       case "create_branch": {
-        const owner = args!.owner as string;
-        const repo = args!.repo as string;
-        const repoData = await octokit.repos.get({ owner, repo });
-        const fromBranch = (args!.from_branch as string) ?? repoData.data.default_branch;
-        const { data: refData } = await octokit.git.getRef({ owner, repo, ref: `heads/${fromBranch}` });
-        await octokit.git.createRef({ owner, repo, ref: `refs/heads/${args!.branch as string}`, sha: refData.object.sha });
-        return { content: [{ type: "text", text: `Branch '${args!.branch}' created from '${fromBranch}'` }] };
+        const repoData = await octokit.repos.get({ owner: args.owner, repo: args.repo });
+        const fromBranch = args.from_branch ?? repoData.data.default_branch;
+        const { data: refData } = await octokit.git.getRef({ owner: args.owner, repo: args.repo, ref: `heads/${fromBranch}` });
+        await octokit.git.createRef({ owner: args.owner, repo: args.repo, ref: `refs/heads/${args.branch}`, sha: refData.object.sha });
+        return { content: [{ type: "text", text: `Branch '${args.branch}' created from '${fromBranch}'` }] };
       }
 
       case "delete_branch": {
-        await octokit.git.deleteRef({ owner: args!.owner as string, repo: args!.repo as string, ref: `heads/${args!.branch as string}` });
-        return { content: [{ type: "text", text: `Branch '${args!.branch}' deleted` }] };
+        await octokit.git.deleteRef({ owner: args.owner, repo: args.repo, ref: `heads/${args.branch}` });
+        return { content: [{ type: "text", text: `Branch '${args.branch}' deleted` }] };
       }
 
       case "get_file": {
         const { data } = await octokit.repos.getContent({
-          owner: args!.owner as string, repo: args!.repo as string,
-          path: args!.path as string, ref: args?.branch as string
+          owner: args.owner, repo: args.repo, path: args.path, ref: args.branch
         });
         if (Array.isArray(data)) throw new Error("Path is a directory, use list_directory instead");
         if (data.type !== "file") throw new Error(`Not a file: ${data.type}`);
@@ -435,81 +577,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "create_or_update_file": {
-        const content = Buffer.from(args!.content as string, "utf-8").toString("base64");
+        const content = Buffer.from(args.content, "utf-8").toString("base64");
         const { data } = await octokit.repos.createOrUpdateFileContents({
-          owner: args!.owner as string, repo: args!.repo as string,
-          path: args!.path as string, message: args!.message as string,
-          content, branch: args?.branch as string, sha: args?.sha as string
+          owner: args.owner, repo: args.repo, path: args.path, message: args.message,
+          content, branch: args.branch, sha: args.sha
         });
-        return { content: [{ type: "text", text: `File ${data.content?.path} ${args?.sha ? "updated" : "created"}\nCommit: ${data.commit.sha}` }] };
+        return { content: [{ type: "text", text: `File ${data.content?.path} ${args.sha ? "updated" : "created"}\nCommit: ${data.commit.sha}` }] };
       }
 
       case "delete_file": {
         const { data } = await octokit.repos.deleteFile({
-          owner: args!.owner as string, repo: args!.repo as string,
-          path: args!.path as string, message: args!.message as string,
-          sha: args!.sha as string, branch: args?.branch as string
+          owner: args.owner, repo: args.repo, path: args.path,
+          message: args.message, sha: args.sha, branch: args.branch
         });
         return { content: [{ type: "text", text: `File deleted. Commit: ${data.commit.sha}` }] };
       }
 
       case "list_directory": {
-        const { data } = await octokit.repos.getContent({
-          owner: args!.owner as string, repo: args!.repo as string,
-          path: (args?.path as string) ?? "", ref: args?.branch as string
-        });
+        const { data } = await octokit.repos.getContent({ owner: args.owner, repo: args.repo, path: args.path, ref: args.branch });
         if (!Array.isArray(data)) throw new Error("Path is a file, use get_file instead");
         return { content: [{ type: "text", text: JSON.stringify(data.map(f => ({ name: f.name, type: f.type, path: f.path, sha: f.sha, size: f.size })), null, 2) }] };
       }
 
       case "list_issues": {
-        const { data } = await octokit.issues.listForRepo({
-          owner: args!.owner as string, repo: args!.repo as string,
-          state: (args?.state as any) ?? "open", per_page: (args?.per_page as number) ?? 30
-        });
+        const { data } = await octokit.issues.listForRepo(args);
         return { content: [{ type: "text", text: JSON.stringify(data.map(i => ({
           number: i.number, title: i.title, state: i.state,
-          labels: i.labels.map((l: any) => l.name), created_at: i.created_at
+          labels: i.labels.map((l: any) => typeof l === "string" ? l : l.name), created_at: i.created_at
         })), null, 2) }] };
       }
 
       case "get_issue": {
-        const { data } = await octokit.issues.get({ owner: args!.owner as string, repo: args!.repo as string, issue_number: args!.issue_number as number });
+        const { data } = await octokit.issues.get(args);
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
 
       case "create_issue": {
-        const { data } = await octokit.issues.create({
-          owner: args!.owner as string, repo: args!.repo as string,
-          title: args!.title as string, body: args?.body as string,
-          labels: args?.labels as string[], assignees: args?.assignees as string[]
-        });
+        const { data } = await octokit.issues.create(args);
         return { content: [{ type: "text", text: `Issue #${data.number} created: ${data.html_url}` }] };
       }
 
       case "update_issue": {
-        const { data } = await octokit.issues.update({
-          owner: args!.owner as string, repo: args!.repo as string,
-          issue_number: args!.issue_number as number, title: args?.title as string,
-          body: args?.body as string, state: args?.state as any,
-          labels: args?.labels as string[], assignees: args?.assignees as string[]
-        });
+        const { data } = await octokit.issues.update(args);
         return { content: [{ type: "text", text: `Issue #${data.number} updated: ${data.html_url}` }] };
       }
 
       case "comment_on_issue": {
-        const { data } = await octokit.issues.createComment({
-          owner: args!.owner as string, repo: args!.repo as string,
-          issue_number: args!.issue_number as number, body: args!.body as string
-        });
+        const { data } = await octokit.issues.createComment(args);
         return { content: [{ type: "text", text: `Comment added: ${data.html_url}` }] };
       }
 
       case "list_pull_requests": {
-        const { data } = await octokit.pulls.list({
-          owner: args!.owner as string, repo: args!.repo as string,
-          state: (args?.state as any) ?? "open", per_page: (args?.per_page as number) ?? 30
-        });
+        const { data } = await octokit.pulls.list(args);
         return { content: [{ type: "text", text: JSON.stringify(data.map(p => ({
           number: p.number, title: p.title, state: p.state,
           head: p.head.ref, base: p.base.ref, draft: p.draft
@@ -517,39 +636,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_pull_request": {
-        const { data } = await octokit.pulls.get({ owner: args!.owner as string, repo: args!.repo as string, pull_number: args!.pull_number as number });
+        const { data } = await octokit.pulls.get(args);
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
 
       case "create_pull_request": {
-        const { data } = await octokit.pulls.create({
-          owner: args!.owner as string, repo: args!.repo as string,
-          title: args!.title as string, body: args?.body as string,
-          head: args!.head as string, base: args!.base as string, draft: args?.draft as boolean
-        });
+        const { data } = await octokit.pulls.create(args);
         return { content: [{ type: "text", text: `PR #${data.number} created: ${data.html_url}` }] };
       }
 
       case "merge_pull_request": {
-        const { data } = await octokit.pulls.merge({
-          owner: args!.owner as string, repo: args!.repo as string,
-          pull_number: args!.pull_number as number,
-          merge_method: (args?.merge_method as any) ?? "merge",
-          commit_message: args?.commit_message as string
-        });
+        const { confirm, ...mergeArgs } = args;
+        const { data } = await octokit.pulls.merge(mergeArgs);
         return { content: [{ type: "text", text: `PR merged: ${data.message}\nSHA: ${data.sha}` }] };
       }
 
       case "list_workflows": {
-        const { data } = await octokit.actions.listRepoWorkflows({ owner: args!.owner as string, repo: args!.repo as string });
+        const { data } = await octokit.actions.listRepoWorkflows(args);
         return { content: [{ type: "text", text: JSON.stringify(data.workflows.map(w => ({ id: w.id, name: w.name, path: w.path, state: w.state })), null, 2) }] };
       }
 
       case "list_workflow_runs": {
-        const { data } = await octokit.actions.listWorkflowRuns({
-          owner: args!.owner as string, repo: args!.repo as string,
-          workflow_id: args!.workflow_id as string, per_page: (args?.per_page as number) ?? 10
-        });
+        const { data } = await octokit.actions.listWorkflowRuns(args);
         return { content: [{ type: "text", text: JSON.stringify(data.workflow_runs.map(r => ({
           id: r.id, status: r.status, conclusion: r.conclusion,
           branch: r.head_branch, created_at: r.created_at
@@ -557,23 +665,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "trigger_workflow": {
-        await octokit.actions.createWorkflowDispatch({
-          owner: args!.owner as string, repo: args!.repo as string,
-          workflow_id: args!.workflow_id as string, ref: args!.ref as string,
-          inputs: (args?.inputs as Record<string, string>) ?? {}
-        });
-        return { content: [{ type: "text", text: `Workflow '${args!.workflow_id}' triggered on '${args!.ref}'` }] };
+        const { confirm, ...triggerArgs } = args;
+        await octokit.actions.createWorkflowDispatch(triggerArgs);
+        return { content: [{ type: "text", text: `Workflow '${args.workflow_id}' triggered on '${args.ref}'` }] };
       }
 
       case "search_code": {
-        const { data } = await octokit.search.code({ q: args!.query as string, per_page: (args?.per_page as number) ?? 20 });
+        const { data } = await octokit.search.code({ q: args.query, per_page: args.per_page });
         return { content: [{ type: "text", text: JSON.stringify(data.items.map(i => ({
           name: i.name, path: i.path, repo: i.repository.full_name, html_url: i.html_url
         })), null, 2) }] };
       }
 
       case "search_issues": {
-        const { data } = await octokit.search.issuesAndPullRequests({ q: args!.query as string, per_page: (args?.per_page as number) ?? 20 });
+        const { data } = await octokit.search.issuesAndPullRequests({ q: args.query, per_page: args.per_page });
         return { content: [{ type: "text", text: JSON.stringify(data.items.map(i => ({
           number: i.number, title: i.title, state: i.state, html_url: i.html_url
         })), null, 2) }] };
@@ -581,8 +686,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "list_commits": {
         const { data } = await octokit.repos.listCommits({
-          owner: args!.owner as string, repo: args!.repo as string,
-          sha: args?.branch as string, per_page: (args?.per_page as number) ?? 20
+          owner: args.owner, repo: args.repo, sha: args.branch, per_page: args.per_page
         });
         return { content: [{ type: "text", text: JSON.stringify(data.map(c => ({
           sha: c.sha, message: c.commit.message, author: c.commit.author?.name, date: c.commit.author?.date
@@ -590,10 +694,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "create_repo": {
-        const { data } = await octokit.repos.createForAuthenticatedUser({
-          name: args!.name as string, description: args?.description as string,
-          private: (args?.private as boolean) ?? true, auto_init: (args?.auto_init as boolean) ?? true
-        });
+        const { data } = await octokit.repos.createForAuthenticatedUser(args);
         return { content: [{ type: "text", text: `Repo created: ${data.html_url}` }] };
       }
 
@@ -604,15 +705,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           public_repos: data.public_repos, total_private_repos: data.total_private_repos
         }, null, 2) }] };
       }
-
-      default:
-        throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error: any) {
     return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
   }
 });
 
+await checkTokenScopes();
 const transport = new StdioServerTransport();
 await server.connect(transport);
 console.error("GitHub MCP server running");
+]]>
