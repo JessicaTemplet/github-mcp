@@ -1,4 +1,4 @@
-# github-mcp
+<![CDATA[# github-mcp
 
 A Model Context Protocol (MCP) server that gives Claude direct access to
 GitHub: repos, files, branches, issues, pull requests, GitHub Actions, and
@@ -24,6 +24,26 @@ their repos outside of Claude Code.
 - Create new repos
 - Get info on the authenticated user
 
+## Argument validation
+
+Every tool call is validated against a schema before it touches the GitHub
+API. A missing or malformed argument returns a specific message (e.g.
+`repo: Required`) instead of a raw runtime error from deep inside the
+handler.
+
+## Destructive operations require confirmation
+
+`delete_branch`, `delete_file`, `merge_pull_request`, and `trigger_workflow`
+are the four tools that change state in a way that isn't trivially
+reversible. Each requires `confirm: true` in the call arguments. Calling one
+without it does not touch GitHub — it returns a preview of exactly what
+would run, so the caller (or the model driving the caller) has to state the
+intent explicitly rather than an LLM being able to delete a branch or merge
+a PR as a side effect of a poorly-scoped request.
+
+Every other tool (reads, creates, comments, issue updates) runs immediately,
+same as before.
+
 ## Setup
 
 1. Clone this repo and install dependencies:
@@ -38,7 +58,10 @@ their repos outside of Claude Code.
 2. Create a GitHub personal access token at
    [Settings -> Developer settings -> Personal access tokens](https://github.com/settings/tokens).
    Give it the scopes you actually need (`repo` for private repo access,
-   `workflow` if you want it triggering Actions).
+   `workflow` if you want it triggering Actions). On startup the server
+   checks the token's scopes where the token type exposes them, and prints
+   a warning immediately if `repo` or `workflow` is missing, rather than
+   letting it surface later as a confusing 403 on first use.
 
 3. Add it to your Claude Desktop config. Don't create a
    `claude_desktop_config.json` yourself somewhere and expect Claude Desktop
@@ -68,8 +91,10 @@ their repos outside of Claude Code.
 - The token is read from an environment variable at runtime and is never
   written to disk by this server. Don't commit a token or a `.env` file to
   this repo.
-- Built against the official `@modelcontextprotocol/sdk` and `@octokit/rest`.
+- Built against the official `@modelcontextprotocol/sdk`, `@octokit/rest`,
+  and `zod` for argument validation.
 
 ## License
 
 MIT, see [LICENSE](./LICENSE).
+]]>
